@@ -3,25 +3,28 @@
 // Input taken from virtual devices (BlackHole, Loopback) doesn't count: macOS shows no pill for it.
 // (The dot after the clock can't be covered: macOS keeps it above every app window.)
 //
-// Finding the pill: MicPatch keeps an invisible 1-pt status item as an anchor. When the mic
-// turns on, macOS inserts the pill next to it and shifts items left by a small inset for the
-// dot, so how far the anchor moves says where the pill is.
+// Finding the pill: MicPatch reads its frame through Accessibility. The pill is the menu bar item
+// with identifier com.apple.menuextra.audiovideo ("Audio and Video Controls"), drawn by MenuBarAgent.
+// Needs Accessibility permission (System Settings > Privacy & Security > Accessibility); without it
+// MicPatch does nothing.
 //
 // The background comes from menubar-bg.png, built from a screenshot by calibrate.swift.
 //
 // Logs to ~/Library/Logs/MicPatch.log. Quit with: pkill -x MicPatch
-// Run with --register-login or --unregister-login to add or remove it as a login item.
+// Run with --register-login or --unregister-login to add or remove it as a login item,
+// or --list-items to print the menu bar items it can see.
 
 import AppKit
+import ApplicationServices
 import CoreAudio
 import ServiceManagement
 
 let calibratedSize = NSSize(width: 1710, height: 1107)  // screen menubar-bg.png was taken on
 let bandScale: CGFloat = 2          // menubar-bg.png pixels per point
 let patchHeight: CGFloat = 33       // the menu bar is 34 pt tall; stay off its bottom edge
+let pillHalfWidth: CGFloat = 20     // the pill is ~36 pt wide around the 16 pt item Accessibility reports
 let pillLinger: TimeInterval = 4    // keep the pill covered while it fades out
-let reanchorInterval: TimeInterval = 30
-let dryRun = CommandLine.arguments.contains("--dry-run")   // invisible patch, fake 3 s of mic use
+let dryRun = CommandLine.arguments.contains("--dry-run")   // fake 3 s of mic use and log what's found
 
 // MARK: - Log
 
@@ -104,6 +107,65 @@ enum Mic {
     }
 }
 
+// MARK: - Menu bar items (Accessibility)
+
+struct MenuItem {
+    let element: AXUIElement
+    let identifier: String
+    let label: String     // for the log
+    let frame: CGRect     // global coordinates, top-left origin like window bounds
+}
+
+enum MenuBarItems {
+    static let pillIdentifier = "com.apple.menuextra.audiovideo"
+
+    static func attribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
+        var value: AnyObject?
+        return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
+    }
+
+    static func string(_ element: AXUIElement, _ name: String) -> String {
+        attribute(element, name) as? String ?? ""
+    }
+
+    static func frame(_ element: AXUIElement) -> CGRect? {
+        guard let p = attribute(element, kAXPositionAttribute), CFGetTypeID(p) == AXValueGetTypeID(),
+              let s = attribute(element, kAXSizeAttribute), CFGetTypeID(s) == AXValueGetTypeID() else { return nil }
+        var origin = CGPoint.zero, size = CGSize.zero
+        guard AXValueGetValue(p as! AXValue, .cgPoint, &origin), AXValueGetValue(s as! AXValue, .cgSize, &size) else { return nil }
+        return CGRect(origin: origin, size: size)
+    }
+
+    static func item(_ element: AXUIElement) -> MenuItem? {
+        guard let f = frame(element) else { return nil }
+        let identifier = string(element, kAXIdentifierAttribute)
+        let label = "id='\(identifier)' desc='\(string(element, kAXDescriptionAttribute))' "
+            + String(format: "x %.1f–%.1f y %.1f h %.1f", f.minX, f.maxX, f.minY, f.height)
+        return MenuItem(element: element, identifier: identifier, label: label, frame: f)
+    }
+
+    /// The items MenuBarAgent draws. Its extras bar lists anonymous slots; the named item sits at
+    /// each slot's center, so hit-test there to get it.
+    static func systemItems() -> [MenuItem] {
+        guard let agent = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent").first
+        else { return [] }
+        let root = AXUIElementCreateApplication(agent.processIdentifier)
+        AXUIElementSetMessagingTimeout(root, 0.25)
+        guard let bar = attribute(root, "AXExtrasMenuBar"), CFGetTypeID(bar) == AXUIElementGetTypeID(),
+              let slots = attribute(bar as! AXUIElement, kAXChildrenAttribute) as? [AXUIElement] else { return [] }
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.25)
+        return slots.compactMap { slot in
+            guard let slotItem = item(slot) else { return nil }
+            if !slotItem.identifier.isEmpty { return slotItem }
+            var hit: AXUIElement?
+            guard AXUIElementCopyElementAtPosition(system, Float(slotItem.frame.midX), Float(slotItem.frame.midY), &hit) == .success,
+                  let hit, let named = item(hit), !named.identifier.isEmpty else { return slotItem }
+            return named
+        }
+    }
+}
+
 // MARK: - Patch window
 
 final class PatchPanel: NSPanel {
@@ -136,8 +198,6 @@ final class Patch {
         view.wantsLayer = true
         panel.contentView = view
     }
-
-    var frame: NSRect? { panel.isVisible ? panel.frame : nil }
 
     func show(_ rect: NSRect, key newKey: String, image: () -> CGImage?) {
         let k = "\(newKey) \(rect)"
@@ -172,37 +232,20 @@ func smoothRamp(_ t: CGFloat) -> CGFloat {
 
 final class Controller: NSObject, NSApplicationDelegate {
     private var band: CGImage!
-    private var anchor: NSStatusItem?
-    private var anchorCreated = Date.distantPast
-    private var idleMinX: CGFloat?        // anchor position with the mic idle (no indicator inset)
-    private var learnedInset: CGFloat?    // how far items shift left while the dot is shown
-    private var lastShift: CGFloat?
-    private var shiftStableTicks = 0     // fast ticks the shift has stayed unchanged
     private var micOn = false
     private var micChanged = Date.distantPast
-    private var anchoredWithPillUp = false   // the anchor was made while the pill was up, so it sits left of the pill
+    private var axTrusted = false
+    private var pillItem: MenuItem?       // the pill, found through Accessibility
+    private var dumpedItems = false
     private var fakeMicUntil: Date?
     private let pill = Patch()
     private var fastTimer: Timer?
     private var watched = Set<AudioObjectID>()
     private var barVisible = true
     private var ticks = 0
-    private var loggedActivation = false
+    private var loggedCover = false
 
     private var screen: NSScreen? { NSScreen.screens.first { $0.frame.size == calibratedSize } }
-
-    /// Frame of the invisible anchor item, once macOS has placed it on the calibrated screen.
-    private var anchorFrame: NSRect? {
-        guard let f = anchor?.button?.window?.frame, let s = screen,
-              f.minX > s.frame.minX + s.frame.width * 0.3, f.maxX <= s.frame.maxX else { return nil }
-        return f
-    }
-
-    /// How far the anchor has moved left since the mic was idle.
-    private var shift: CGFloat? {
-        guard let base = idleMinX, let f = anchorFrame else { return nil }
-        return base - f.minX
-    }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         guard let url = Bundle.main.url(forResource: "menubar-bg", withExtension: "png"),
@@ -215,16 +258,17 @@ final class Controller: NSObject, NSApplicationDelegate {
         band = image
         log("started (pid \(getpid()))\(dryRun ? " dry run" : "")")
         if screen == nil { log("no \(Int(calibratedSize.width))x\(Int(calibratedSize.height)) screen; patch stays off") }
+        axTrusted = AXIsProcessTrusted()
+        if !axTrusted, !dryRun {
+            // Shows the system prompt that sends the user to Privacy & Security > Accessibility.
+            let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            axTrusted = AXIsProcessTrustedWithOptions(prompt)
+        }
+        log("accessibility \(axTrusted ? "granted" : "not granted; nothing will be covered until it is")")
         micOn = !Mic.recordingPIDs().isEmpty
         micChanged = micOn ? Date() : .distantPast
-        makeAnchor()
         watchAudio()
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.slowTick() }
-        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
-                                               object: nil, queue: .main) { [weak self] _ in
-            self?.idleMinX = nil
-            self?.makeAnchor()
-        }
         if dryRun {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                 self?.fakeMicUntil = Date().addingTimeInterval(3)
@@ -232,13 +276,6 @@ final class Controller: NSObject, NSApplicationDelegate {
             }
         }
         evaluate()
-    }
-
-    private func makeAnchor() {
-        if let old = anchor { NSStatusBar.system.removeStatusItem(old) }
-        anchor = NSStatusBar.system.statusItem(withLength: 1)
-        anchorCreated = Date()
-        anchoredWithPillUp = micOn   // a new item lands at the left end, left of any pill already up
     }
 
     private func watchAudio() {
@@ -262,13 +299,24 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     private func slowTick() {
         evaluate()
-        guard !micOn, fastTimer == nil, Date().timeIntervalSince(micChanged) > 3 else { return }
-        // Mic idle: re-create the anchor now and then so it stays the leftmost item,
-        // and remember where it sits without the indicator inset.
-        if Date().timeIntervalSince(anchorCreated) > reanchorInterval {
-            makeAnchor()
-        } else if Date().timeIntervalSince(anchorCreated) > 1.5, let f = anchorFrame {
-            idleMinX = f.minX
+        let trusted = AXIsProcessTrusted()
+        if trusted != axTrusted {
+            axTrusted = trusted
+            log("accessibility \(trusted ? "granted" : "revoked")")
+        }
+    }
+
+    /// Finds the pill among the items MenuBarAgent draws. Logs every item once per recording if
+    /// it isn't there, so a changed identifier shows up in the log.
+    private func locatePill() {
+        let items = MenuBarItems.systemItems()
+        if let found = items.first(where: { $0.identifier == MenuBarItems.pillIdentifier }) {
+            if pillItem == nil { log("pill: \(found.label)") }
+            pillItem = found
+        } else if !dumpedItems, Date().timeIntervalSince(micChanged) > 1.5 {
+            dumpedItems = true
+            log("pill not found; menu bar items:\(items.isEmpty ? " none" : "")")
+            for item in items { log("  \(item.label)") }
         }
     }
 
@@ -281,13 +329,15 @@ final class Controller: NSObject, NSApplicationDelegate {
         if on != micOn {
             micOn = on
             micChanged = Date()
-            loggedActivation = false
             if on {
-                log("mic on: \(pids.map(appName).joined(separator: ", ")); anchor \(describe(anchorFrame)), idle x \(idleMinX.map { String(format: "%.1f", $0) } ?? "unknown")")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.logState() }
+                log("mic on: \(pids.map(appName).joined(separator: ", "))")
+                pillItem = nil
+                dumpedItems = false
+                loggedCover = false
+                if axTrusted { locatePill() }
             } else {
+                // Keep pillItem: the pill fades out in place, so its last frame is right for the linger.
                 log("mic off")
-                anchoredWithPillUp = false
             }
         }
         let active = micOn || Date().timeIntervalSince(micChanged) < pillLinger
@@ -305,8 +355,17 @@ final class Controller: NSObject, NSApplicationDelegate {
             fastTimer?.invalidate()
             fastTimer = nil
             pill.hide()
+            pillItem = nil
             if dryRun { log("dry run done"); NSApp.terminate(nil) }
             return
+        }
+        // Follow the pill as the menu bar reflows; look for it again if its element went away.
+        if micOn, axTrusted, ticks % 4 == 2 {
+            if let p = pillItem, let f = MenuBarItems.frame(p.element) {
+                pillItem = MenuItem(element: p.element, identifier: p.identifier, label: p.label, frame: f)
+            } else {
+                locatePill()
+            }
         }
         update()
     }
@@ -314,39 +373,17 @@ final class Controller: NSObject, NSApplicationDelegate {
     private func update() {
         guard let s = screen else { pill.hide(); return }
         let top = s.frame.maxY
-        let sh = shift
-        let sinceChange = Date().timeIntervalSince(micChanged)
-
-        var pillCase = "hidden"
-        if barVisible, micOn || sinceChange < pillLinger, let f = anchorFrame {
-            let r: NSRect
-            let feather: Feather
-            if let sh, sh >= 30 {
-                // The pill landed right of the anchor: the anchor moved by inset + pill width.
-                pillCase = "right of anchor"
-                r = NSRect(x: f.maxX, y: top - patchHeight, width: max(sh - (learnedInset ?? 15), 20), height: patchHeight)
-                feather = Feather(left: 3, right: 3, bottom: 3)
-            } else if anchoredWithPillUp, idleMinX == nil {
-                // The pill was already up when the anchor was made, so the anchor went left of it.
-                pillCase = "right of anchor (guess)"
-                r = NSRect(x: f.maxX, y: top - patchHeight, width: 46, height: patchHeight)
-                feather = Feather(left: 3, right: 3, bottom: 3)
-            } else {
-                pillCase = "left of anchor"
-                r = NSRect(x: f.minX - 70, y: top - patchHeight, width: 79, height: patchHeight)
-                feather = Feather(left: 8, right: 5, bottom: 3)
-            }
-            pill.show(r, key: pillCase) { makeImage(r, on: s, feather: feather) }
-        } else {
-            pill.hide()
-        }
-
-        // Learn the dot inset only from a shift that has held still, not from a frame sampled mid-move.
-        if sh == lastShift { shiftStableTicks += 1 } else { lastShift = sh; shiftStableTicks = 0 }
-        if micOn, let sh, sh > 5, sh < 30, shiftStableTicks >= 10 { learnedInset = sh }
-        if micOn, !loggedActivation, sinceChange > 0.5 {
-            loggedActivation = true
-            log("patch: pill \(pillCase) \(describe(pill.frame)), shift \(sh.map { String(format: "%.1f", $0) } ?? "?"), menu bar \(barVisible ? "visible" : "hidden")")
+        let primaryTop = NSScreen.screens.first?.frame.maxY ?? top
+        let covering = micOn || Date().timeIntervalSince(micChanged) < pillLinger
+        guard barVisible, covering, let p = pillItem,
+              abs(p.frame.minY - (primaryTop - top)) < 12, p.frame.minX >= s.frame.minX, p.frame.maxX <= s.frame.maxX
+        else { pill.hide(); return }
+        let half = max(pillHalfWidth, p.frame.width / 2 + 4)
+        let r = NSRect(x: p.frame.midX - half, y: top - patchHeight, width: half * 2, height: patchHeight)
+        pill.show(r, key: "pill") { makeImage(r, on: s, feather: Feather(left: 2, right: 2, bottom: 3)) }
+        if micOn, !loggedCover {
+            loggedCover = true
+            log("covering \(describe(r))")
         }
     }
 
@@ -387,19 +424,18 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
         return false
     }
-
-    private func logState() {
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return }
-        for w in list {
-            guard let d = w[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: d),
-                  b.minY < 40, b.height < 80 else { continue }
-            log("  window \(w[kCGWindowOwnerName as String] ?? "?") layer \(w[kCGWindowLayer as String] ?? "?") \(b)")
-        }
-        log("  anchor \(describe(anchorFrame)), shift \(shift.map { String(format: "%.1f", $0) } ?? "?")")
-    }
 }
 
-// MARK: - Login item
+// MARK: - Command-line flags
+
+if CommandLine.arguments.contains("--list-items") {
+    // Prints the menu bar items MicPatch can see; the pill shows up while the mic is in use.
+    guard AXIsProcessTrusted() else { print("Accessibility not granted for this process"); exit(1) }
+    for item in MenuBarItems.systemItems() {
+        print("\(item.identifier == MenuBarItems.pillIdentifier ? "PILL " : "     ")\(item.label)")
+    }
+    exit(0)
+}
 
 if let flag = ["--register-login", "--unregister-login"].first(where: CommandLine.arguments.contains) {
     let register = flag == "--register-login"

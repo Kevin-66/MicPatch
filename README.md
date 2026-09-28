@@ -7,8 +7,10 @@ Built on macOS 27 (MacBook Air, 1710×1107-point screen).
 ## How it works
 
 - Watches Core Audio for any process recording from a physical input device (`kAudioProcessPropertyIsRunningInput`, macOS 14.2+). Input from virtual devices such as BlackHole or Loopback is ignored, since macOS shows no pill for it.
-- Keeps an invisible 1-point status item as an anchor. When the mic turns on, macOS adds the pill next to it and shifts the menu bar items, so the anchor's movement tells MicPatch where the pill is.
+- Reads the pill's exact frame through Accessibility. On macOS 27 the pill is the menu bar item `com.apple.menuextra.audiovideo` ("Audio and Video Controls"), drawn by MenuBarAgent.
 - Draws a borderless, click-through window over the pill, filled with a clean image of the menu bar background (`menubar-bg.png`) with feathered edges.
+
+MicPatch needs Accessibility permission (System Settings → Privacy & Security → Accessibility) and asks for it on launch. Without it, it covers nothing. The build is ad-hoc signed, so macOS treats every rebuild as a new app: after rebuilding, switch MicPatch off and on again in that list.
 
 MicPatch doesn't change any privacy settings or use the mic. It only draws over the pill.
 
@@ -40,7 +42,7 @@ open MicPatch.app
 
 Quit with `pkill -x MicPatch`. It logs to `~/Library/Logs/MicPatch.log`.
 
-To check placement without the mic, quit MicPatch and run `open MicPatch.app --args --dry-run`. It fakes 3 seconds of mic use with an invisible patch and logs where the patch went.
+To see what MicPatch can find, run `MicPatch.app/Contents/MacOS/MicPatch --list-items` from a terminal that has Accessibility permission. While the mic is in use, the pill is marked `PILL`. If it's missing (for example after a macOS update renames it), the list shows what to look for, and `pillIdentifier` in `MicPatch.swift` is the value to change.
 
 ## Recalibrate
 
