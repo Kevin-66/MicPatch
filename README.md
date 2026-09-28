@@ -6,7 +6,7 @@ Built on macOS 27 (MacBook Air, 1710×1107-point screen).
 
 ## How it works
 
-- Watches Core Audio for any process recording from an input device (`kAudioProcessPropertyIsRunningInput`, macOS 14.2+).
+- Watches Core Audio for any process recording from a physical input device (`kAudioProcessPropertyIsRunningInput`, macOS 14.2+). Input from virtual devices such as BlackHole or Loopback is ignored, since macOS shows no pill for it.
 - Keeps an invisible 1-point status item as an anchor. When the mic turns on, macOS adds the pill next to it and shifts the menu bar items, so the anchor's movement tells MicPatch where the pill is.
 - Draws a borderless, click-through window over the pill, filled with a clean image of the menu bar background (`menubar-bg.png`) with feathered edges.
 

@@ -1,5 +1,6 @@
 // MicPatch: hides the microphone-in-use pill that macOS shows in the menu bar by drawing a
 // patch of the menu bar background over it while something is recording from the mic.
+// Input taken from virtual devices (BlackHole, Loopback) doesn't count: macOS shows no pill for it.
 // (The dot after the clock can't be covered: macOS keeps it above every app window.)
 //
 // Finding the pill: MicPatch keeps an invisible 1-pt status item as an anchor. When the mic
@@ -50,19 +51,22 @@ func appName(_ pid: pid_t) -> String {
 enum Mic {
     static let system = AudioObjectID(kAudioObjectSystemObject)
 
-    static func address(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
-        AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
-                                   mElement: kAudioObjectPropertyElementMain)
+    static func address(_ selector: AudioObjectPropertySelector,
+                        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
     }
 
-    static func processes() -> [AudioObjectID] {
-        var a = address(kAudioHardwarePropertyProcessObjectList)
+    static func objectList(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
+                           scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> [AudioObjectID] {
+        var a = address(selector, scope: scope)
         var size: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(system, &a, 0, nil, &size) == noErr, size > 0 else { return [] }
+        guard AudioObjectGetPropertyDataSize(object, &a, 0, nil, &size) == noErr, size > 0 else { return [] }
         var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
-        guard AudioObjectGetPropertyData(system, &a, 0, nil, &size, &ids) == noErr else { return [] }
+        guard AudioObjectGetPropertyData(object, &a, 0, nil, &size, &ids) == noErr else { return [] }
         return ids
     }
+
+    static func processes() -> [AudioObjectID] { objectList(system, kAudioHardwarePropertyProcessObjectList) }
 
     static func uint32(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32 {
         var a = address(selector)
@@ -71,10 +75,29 @@ enum Mic {
         return AudioObjectGetPropertyData(id, &a, 0, nil, &size, &value) == noErr ? value : 0
     }
 
-    /// PIDs of processes currently recording from any input device.
+    /// Whether a device is real hardware, or an aggregate that contains some. Virtual devices such
+    /// as BlackHole or Loopback take input without macOS showing the microphone indicator.
+    static func isPhysical(_ device: AudioObjectID, depth: Int = 0) -> Bool {
+        switch uint32(device, kAudioDevicePropertyTransportType) {
+        case UInt32(kAudioDeviceTransportTypeVirtual):
+            return false
+        case UInt32(kAudioDeviceTransportTypeAggregate):
+            return depth < 2 && objectList(device, kAudioAggregateDevicePropertyActiveSubDeviceList)
+                .contains { isPhysical($0, depth: depth + 1) }
+        default:
+            return true
+        }
+    }
+
+    /// PIDs of processes currently recording from a physical input device. A process whose device
+    /// list can't be read still counts, so an unreadable list never leaves the pill uncovered.
     static func recordingPIDs() -> [pid_t] {
         processes()
-            .filter { uint32($0, kAudioProcessPropertyIsRunningInput) != 0 }
+            .filter { process in
+                guard uint32(process, kAudioProcessPropertyIsRunningInput) != 0 else { return false }
+                let devices = objectList(process, kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeInput)
+                return devices.isEmpty || devices.contains { isPhysical($0) }
+            }
             .map { pid_t(bitPattern: uint32($0, kAudioProcessPropertyPID)) }
     }
 }
@@ -151,9 +174,11 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var anchorCreated = Date.distantPast
     private var idleMinX: CGFloat?        // anchor position with the mic idle (no indicator inset)
     private var learnedInset: CGFloat?    // how far items shift left while the dot is shown
+    private var lastShift: CGFloat?
+    private var shiftStableTicks = 0     // fast ticks the shift has stayed unchanged
     private var micOn = false
     private var micChanged = Date.distantPast
-    private var startedWithMicOn = false
+    private var anchoredWithPillUp = false   // the anchor was made while the pill was up, so it sits left of the pill
     private var fakeMicUntil: Date?
     private let pill = Patch()
     private var fastTimer: Timer?
@@ -188,11 +213,10 @@ final class Controller: NSObject, NSApplicationDelegate {
         band = image
         log("started (pid \(getpid()))\(dryRun ? " dry run" : "")")
         if screen == nil { log("no \(Int(calibratedSize.width))x\(Int(calibratedSize.height)) screen; patch stays off") }
+        micOn = !Mic.recordingPIDs().isEmpty
+        micChanged = micOn ? Date() : .distantPast
         makeAnchor()
         watchAudio()
-        micOn = !Mic.recordingPIDs().isEmpty
-        startedWithMicOn = micOn
-        micChanged = Date()
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.slowTick() }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in
@@ -212,6 +236,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         if let old = anchor { NSStatusBar.system.removeStatusItem(old) }
         anchor = NSStatusBar.system.statusItem(withLength: 1)
         anchorCreated = Date()
+        anchoredWithPillUp = micOn   // a new item lands at the left end, left of any pill already up
     }
 
     private func watchAudio() {
@@ -260,7 +285,7 @@ final class Controller: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.logState() }
             } else {
                 log("mic off")
-                startedWithMicOn = false
+                anchoredWithPillUp = false
             }
         }
         let active = micOn || Date().timeIntervalSince(micChanged) < pillLinger
@@ -299,8 +324,8 @@ final class Controller: NSObject, NSApplicationDelegate {
                 pillCase = "right of anchor"
                 r = NSRect(x: f.maxX, y: top - patchHeight, width: max(sh - (learnedInset ?? 15), 20), height: patchHeight)
                 feather = Feather(left: 3, right: 3, bottom: 3)
-            } else if startedWithMicOn, idleMinX == nil {
-                // The pill was already up when MicPatch started, so the anchor went left of it.
+            } else if anchoredWithPillUp, idleMinX == nil {
+                // The pill was already up when the anchor was made, so the anchor went left of it.
                 pillCase = "right of anchor (guess)"
                 r = NSRect(x: f.maxX, y: top - patchHeight, width: 46, height: patchHeight)
                 feather = Feather(left: 3, right: 3, bottom: 3)
@@ -314,7 +339,9 @@ final class Controller: NSObject, NSApplicationDelegate {
             pill.hide()
         }
 
-        if micOn, let sh, sh > 5, sh < 30 { learnedInset = sh }
+        // Learn the dot inset only from a shift that has held still, not from a frame sampled mid-move.
+        if sh == lastShift { shiftStableTicks += 1 } else { lastShift = sh; shiftStableTicks = 0 }
+        if micOn, let sh, sh > 5, sh < 30, shiftStableTicks >= 10 { learnedInset = sh }
         if micOn, !loggedActivation, sinceChange > 0.5 {
             loggedActivation = true
             log("patch: pill \(pillCase) \(describe(pill.frame)), shift \(sh.map { String(format: "%.1f", $0) } ?? "?"), menu bar \(barVisible ? "visible" : "hidden")")
