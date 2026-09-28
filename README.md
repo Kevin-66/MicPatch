@@ -18,7 +18,20 @@ MicPatch doesn't change any privacy settings or use the mic. It only draws over 
 - `menubar-bg.png` comes from a screenshot of one screen and wallpaper. If you change the wallpaper, appearance or display, recalibrate (below). The screen size is `calibratedSize` in `MicPatch.swift`; on any other screen size the patch stays off.
 - In full-screen apps the menu bar is hidden, so the patch is off.
 
-## Build and run
+## Install
+
+```bash
+./install.sh
+```
+
+Builds the app, copies it to /Applications, registers it to open at login, and starts it. It appears in System Settings → General → Login Items & Extensions, where you can turn it off. To remove it:
+
+```bash
+/Applications/MicPatch.app/Contents/MacOS/MicPatch --unregister-login
+pkill -x MicPatch; rm -r /Applications/MicPatch.app
+```
+
+## Build and run without installing
 
 ```bash
 ./build.sh

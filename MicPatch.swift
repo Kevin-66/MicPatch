@@ -10,9 +10,11 @@
 // The background comes from menubar-bg.png, built from a screenshot by calibrate.swift.
 //
 // Logs to ~/Library/Logs/MicPatch.log. Quit with: pkill -x MicPatch
+// Run with --register-login or --unregister-login to add or remove it as a login item.
 
 import AppKit
 import CoreAudio
+import ServiceManagement
 
 let calibratedSize = NSSize(width: 1710, height: 1107)  // screen menubar-bg.png was taken on
 let bandScale: CGFloat = 2          // menubar-bg.png pixels per point
@@ -394,6 +396,27 @@ final class Controller: NSObject, NSApplicationDelegate {
             log("  window \(w[kCGWindowOwnerName as String] ?? "?") layer \(w[kCGWindowLayer as String] ?? "?") \(b)")
         }
         log("  anchor \(describe(anchorFrame)), shift \(shift.map { String(format: "%.1f", $0) } ?? "?")")
+    }
+}
+
+// MARK: - Login item
+
+if let flag = ["--register-login", "--unregister-login"].first(where: CommandLine.arguments.contains) {
+    let register = flag == "--register-login"
+    do {
+        if register { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        let status: String
+        switch SMAppService.mainApp.status {
+        case .enabled: status = "enabled"
+        case .requiresApproval: status = "waiting for approval in System Settings > General > Login Items"
+        case .notRegistered: status = "not registered"
+        default: status = "not found"
+        }
+        print("\(register ? "Registered" : "Unregistered") \(Bundle.main.bundlePath) as a login item (\(status))")
+        exit(0)
+    } catch {
+        print("Could not \(register ? "register" : "unregister") login item: \(error.localizedDescription)")
+        exit(1)
     }
 }
 
